@@ -210,7 +210,7 @@ final class AppModel: ObservableObject {
             hud.show(.idle)
             if !runningTests {
                 await waitForInitialLoad()
-                if selectedSTT == .appleSpeech { await appleSpeech.refresh() }
+                if selectedSTT == .appleSpeech { await appleSpeech.prepare() }
             }
         }
     }
@@ -593,7 +593,7 @@ final class AppModel: ObservableObject {
         selectedSTT = provider
         defaults.set(provider.rawValue, forKey: "selectedSTT")
         if provider == .appleSpeech, !appleSpeech.state.readiness.isReady {
-            Task { await appleSpeech.refresh() }
+            Task { await appleSpeech.prepare() }
         }
     }
 

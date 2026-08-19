@@ -74,7 +74,10 @@ final class TranscriptionCoordinator: TranscriptionCoordinating {
         if selectedProvider == .appleSpeech {
             let mode = currentMode
             onModeChange(mode)
-            if !appleSpeech.state.readiness.isReady { await appleSpeech.refresh() }
+            if !appleSpeech.state.readiness.isReady { await appleSpeech.prepare() }
+            guard appleSpeech.state.readiness.isReady else {
+                throw ProviderError.invalidConfiguration(appleSpeech.statusText)
+            }
             let result = try await appleSpeech.transcribe(audio: audio, vocabulary: vocabulary)
             return .init(result: result, mode: mode)
         }
@@ -133,7 +136,7 @@ final class TranscriptionCoordinator: TranscriptionCoordinating {
         onModeChange: (TranscriptionMode) -> Void
     ) async throws -> TranscriptionRun {
         onModeChange(.offline)
-        if !appleSpeech.state.readiness.isReady { await appleSpeech.refresh() }
+        if !appleSpeech.state.readiness.isReady { await appleSpeech.prepare() }
         guard appleSpeech.state.readiness.isReady else { throw offlineModelUnavailableError }
         do {
             let result = try await appleSpeech.transcribe(audio: audio, vocabulary: vocabulary)
