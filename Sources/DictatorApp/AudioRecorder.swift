@@ -24,6 +24,99 @@ protocol AudioCaptureSession: AnyObject, Sendable {
     func cancel()
 }
 
+/// Audio capture via AVAudioEngine. Uses the Core Audio input node directly,
+/// bypassing AVCaptureSession's CMIO graph. On macOS 26+, apps signed ad-hoc
+/// (no Team ID) can have their AVCaptureSession revoked by TCC mid-capture;
+/// AVAudioEngine uses a more stable TCC path that does not exhibit this.
+final class AVAudioEngineCaptureSession: AudioCaptureSession, @unchecked Sendable {
+    private let lifecycleQueue = DispatchQueue(label: "ai.dictator.audio-engine.lifecycle")
+    private let recoverySourceLock = NSLock()
+    private var engine: AVAudioEngine?
+    private var currentRecoverySourceIdentifier: ObjectIdentifier?
+
+    var recoveryNotification: Notification.Name {
+        // AVAudioEngine doesn't post AVCaptureSession.runtimeErrorNotification.
+        // Use a dedicated name so AudioRecorder's observer stays harmless.
+        .init("AVAudioEngineCaptureSessionRuntimeError")
+    }
+
+    var recoverySourceIdentifier: ObjectIdentifier? {
+        recoverySourceLock.withLock { currentRecoverySourceIdentifier }
+    }
+
+    func start(
+        tapHandler: @escaping @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void
+    ) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            lifecycleQueue.async { [self] in
+                do {
+                    try startOnLifecycleQueue(tapHandler: tapHandler)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func stop() async {
+        setRecoverySourceIdentifier(nil)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lifecycleQueue.async { [self] in
+                stopOnLifecycleQueue()
+                continuation.resume()
+            }
+        }
+    }
+
+    func cancel() {
+        setRecoverySourceIdentifier(nil)
+        lifecycleQueue.async { [self] in stopOnLifecycleQueue() }
+    }
+
+    private func startOnLifecycleQueue(
+        tapHandler: @escaping @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void
+    ) throws {
+        stopOnLifecycleQueue()
+        let engine = AVAudioEngine()
+        let inputNode = engine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw AudioRecorderError.noInput
+        }
+
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, time in
+            tapHandler(buffer, time)
+        }
+
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            throw error
+        }
+
+        self.engine = engine
+        setRecoverySourceIdentifier(ObjectIdentifier(engine))
+    }
+
+    private func stopOnLifecycleQueue() {
+        guard let engine else { return }
+        let inputNode = engine.inputNode
+        inputNode.removeTap(onBus: 0)
+        engine.stop()
+        self.engine = nil
+        setRecoverySourceIdentifier(nil)
+    }
+
+    private func setRecoverySourceIdentifier(_ identifier: ObjectIdentifier?) {
+        recoverySourceLock.withLock { currentRecoverySourceIdentifier = identifier }
+    }
+}
+
 final class SystemAudioCaptureSession: AudioCaptureSession, @unchecked Sendable {
     static func audioSettings(sampleRate: Double, channelCount: UInt32) -> [String: Any] {
         [
@@ -207,7 +300,7 @@ final class AudioRecorder: AudioRecording {
     var onLevel: (@Sendable (Double) -> Void)?
 
     init(
-        session: any AudioCaptureSession = SystemAudioCaptureSession(),
+        session: any AudioCaptureSession = AVAudioEngineCaptureSession(),
         notificationCenter: NotificationCenter = .default
     ) {
         self.session = session
