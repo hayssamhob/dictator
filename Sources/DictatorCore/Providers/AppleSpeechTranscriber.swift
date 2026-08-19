@@ -59,10 +59,14 @@ public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
 
     public func availableLocales() async -> [AppleSpeechLocale] {
         var locales: [String: AppleSpeechLocale] = [:]
-        for identifier in await runtime.supportedLocaleIdentifiers(for: .dictationTranscriber) {
+        let dictationIds = await runtime.supportedLocaleIdentifiers(for: .dictationTranscriber)
+        NSLog("[Dictator-Diag] dictationTranscriber supportedLocales: %@", dictationIds.joined(separator: ", "))
+        for identifier in dictationIds {
             locales[identifier] = .init(identifier: identifier, engine: .dictationTranscriber)
         }
-        for identifier in await runtime.supportedLocaleIdentifiers(for: .speechTranscriber) {
+        let speechIds = await runtime.supportedLocaleIdentifiers(for: .speechTranscriber)
+        NSLog("[Dictator-Diag] speechTranscriber supportedLocales: %@", speechIds.joined(separator: ", "))
+        for identifier in speechIds {
             locales[identifier] = .init(identifier: identifier, engine: .speechTranscriber)
         }
         return locales.values.sorted { $0.identifier.localizedStandardCompare($1.identifier) == .orderedAscending }
@@ -70,12 +74,16 @@ public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
 
     public func readiness(for localeIdentifier: String) async -> AppleSpeechReadiness {
         let candidates = await candidates(for: localeIdentifier)
+        NSLog("[Dictator-Diag] readiness for '%@' → candidates: %@", localeIdentifier, candidates.map { "\($0.identifier)/\($0.engine)" }.joined(separator: ", "))
         guard !candidates.isEmpty else {
+            NSLog("[Dictator-Diag] no candidates for '%@'", localeIdentifier)
             return .unavailable("Apple speech transcription does not support this language on this Mac.")
         }
         var downloadable: AppleSpeechLocale?
         for candidate in candidates {
-            switch await runtime.assetStatus(for: candidate) {
+            let status = await runtime.assetStatus(for: candidate)
+            NSLog("[Dictator-Diag] assetStatus for %@/%@ → %@", candidate.identifier, String(describing: candidate.engine), String(describing: status))
+            switch status {
             case .installed: return .ready(candidate)
             case .supported, .downloading: downloadable = downloadable ?? candidate
             case .unsupported: continue
@@ -248,10 +256,13 @@ private struct SystemAppleSpeechRuntime: AppleSpeechRuntime {
     func supportedLocaleIdentifiers(for engine: AppleTranscriptionEngine) async -> [String] {
         switch engine {
         case .speechTranscriber:
+            NSLog("[Dictator-Diag] SpeechTranscriber.isAvailable = %@", SpeechTranscriber.isAvailable ? "true" : "false")
             guard SpeechTranscriber.isAvailable else { return [] }
             return await SpeechTranscriber.supportedLocales.map(\.identifier)
         case .dictationTranscriber:
-            return await DictationTranscriber.supportedLocales.map(\.identifier)
+            let locales = await DictationTranscriber.supportedLocales.map(\.identifier)
+            NSLog("[Dictator-Diag] DictationTranscriber.supportedLocales = %@", locales.joined(separator: ", "))
+            return locales
         }
     }
 
@@ -260,9 +271,13 @@ private struct SystemAppleSpeechRuntime: AppleSpeechRuntime {
         switch engine {
         case .speechTranscriber:
             guard SpeechTranscriber.isAvailable else { return nil }
-            return await SpeechTranscriber.supportedLocale(equivalentTo: requested)?.identifier
+            let resolved = await SpeechTranscriber.supportedLocale(equivalentTo: requested)?.identifier
+            NSLog("[Dictator-Diag] speechTranscriber equivalentLocale for '%@' → %@", identifier, resolved ?? "nil")
+            return resolved
         case .dictationTranscriber:
-            return await DictationTranscriber.supportedLocale(equivalentTo: requested)?.identifier
+            let resolved = await DictationTranscriber.supportedLocale(equivalentTo: requested)?.identifier
+            NSLog("[Dictator-Diag] dictationTranscriber equivalentLocale for '%@' → %@", identifier, resolved ?? "nil")
+            return resolved
         }
     }
 

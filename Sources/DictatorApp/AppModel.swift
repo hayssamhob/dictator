@@ -124,7 +124,12 @@ final class AppModel: ObservableObject {
         let appleSpeech = AppleSpeechCoordinator(
             provider: appleSpeechProvider,
             selectedLocaleIdentifier: defaults.string(forKey: "appleSpeechLocale") ?? Locale.current.identifier,
-            persistSelection: { defaults.set($0, forKey: "appleSpeechLocale") }
+            secondaryLocaleIdentifier: defaults.string(forKey: "appleSpeechSecondaryLocale"),
+            persistSelection: { defaults.set($0, forKey: "appleSpeechLocale") },
+            persistSecondarySelection: { identifier in
+                if let identifier { defaults.set(identifier, forKey: "appleSpeechSecondaryLocale") }
+                else { defaults.removeObject(forKey: "appleSpeechSecondaryLocale") }
+            }
         )
         self.appleSpeech = appleSpeech
         self.transcriptionCoordinator = transcriptionCoordinator ?? TranscriptionCoordinator(
@@ -826,6 +831,14 @@ final class AppModel: ObservableObject {
         guard identifier != appleSpeech.state.selectedLocaleIdentifier else { return }
         appleSpeech.selectLocale(identifier)
         setOfflineFallbackEnabled(false)
+    }
+
+    func selectAppleSpeechSecondaryLocale(_ identifier: String?) {
+        appleSpeech.selectSecondaryLocale(identifier)
+    }
+
+    func swapAppleSpeechLocales() {
+        appleSpeech.swapLocales()
     }
 
     func finishOnboarding() {

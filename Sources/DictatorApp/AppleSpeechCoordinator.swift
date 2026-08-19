@@ -3,14 +3,18 @@ import Foundation
 
 struct AppleSpeechSetupState: Equatable {
     var selectedLocaleIdentifier: String
+    var secondaryLocaleIdentifier: String?
     var locales: [AppleSpeechLocale]
     var readiness: AppleSpeechReadiness
 
     var readyLocale: AppleSpeechLocale? {
-        guard case .ready(let locale) = readiness,
-              locale.identifier == selectedLocaleIdentifier
-        else { return nil }
+        guard case .ready(let locale) = readiness else { return nil }
         return locale
+    }
+
+    var readySecondaryLocale: AppleSpeechLocale? {
+        guard let secondary = secondaryLocaleIdentifier else { return nil }
+        return locales.first { $0.identifier == secondary }
     }
 }
 
@@ -21,18 +25,23 @@ final class AppleSpeechCoordinator: ObservableObject {
     let isAvailable: Bool
     private let provider: (any LocalSpeechTranscribing)?
     private let persistSelection: (String) -> Void
+    private let persistSecondarySelection: (String?) -> Void
     private var generation = 0
 
     init(
         provider: (any LocalSpeechTranscribing)?,
         selectedLocaleIdentifier: String,
-        persistSelection: @escaping (String) -> Void
+        secondaryLocaleIdentifier: String? = nil,
+        persistSelection: @escaping (String) -> Void,
+        persistSecondarySelection: @escaping (String?) -> Void = { _ in }
     ) {
         self.provider = provider
         self.persistSelection = persistSelection
+        self.persistSecondarySelection = persistSecondarySelection
         isAvailable = provider != nil
         state = .init(
             selectedLocaleIdentifier: selectedLocaleIdentifier,
+            secondaryLocaleIdentifier: secondaryLocaleIdentifier,
             locales: [],
             readiness: .checking
         )
@@ -43,7 +52,8 @@ final class AppleSpeechCoordinator: ObservableObject {
         case .checking: "Checking model availability…"
         case .downloadRequired(let locale): "Download \(displayName(for: locale.identifier)) to use Apple On-Device."
         case .downloading(_, let progress): "Downloading model… \(Int(progress * 100))%"
-        case .ready(let locale): "Ready · \(displayName(for: locale.identifier)) · \(engineName(locale.engine))"
+        case .ready(let locale):
+            "Ready · \(displayName(for: locale.identifier))" + (state.secondaryLocaleIdentifier.map { " + \(displayName(for: $0))" } ?? "")
         case .unavailable(let reason), .failed(let reason): reason
         }
     }
@@ -56,6 +66,22 @@ final class AppleSpeechCoordinator: ObservableObject {
         persistSelection(identifier)
         let expectedGeneration = generation
         Task { await refresh(expectedGeneration: expectedGeneration) }
+    }
+
+    func selectSecondaryLocale(_ identifier: String?) {
+        let resolved = identifier.flatMap { id in
+            state.locales.contains(where: { $0.identifier == id }) ? id : nil
+        }
+        guard resolved != state.secondaryLocaleIdentifier else { return }
+        state.secondaryLocaleIdentifier = resolved
+        persistSecondarySelection(resolved)
+    }
+
+    func swapLocales() {
+        guard let secondary = state.secondaryLocaleIdentifier else { return }
+        let primary = state.selectedLocaleIdentifier
+        selectLocale(secondary)
+        selectSecondaryLocale(primary)
     }
 
     func refresh() async {
@@ -114,11 +140,33 @@ final class AppleSpeechCoordinator: ObservableObject {
         guard let locale = state.readyLocale else {
             throw ProviderError.invalidConfiguration("Download the selected Apple speech model before dictating.")
         }
-        return try await provider.transcribe(
-            audio: audio,
-            localeIdentifier: locale.identifier,
-            vocabulary: vocabulary
-        )
+        do {
+            let result = try await provider.transcribe(
+                audio: audio,
+                localeIdentifier: locale.identifier,
+                vocabulary: vocabulary
+            )
+            if !result.text.isEmpty { return result }
+            // Empty transcript — try secondary locale if set
+            if let secondary = state.readySecondaryLocale {
+                return try await provider.transcribe(
+                    audio: audio,
+                    localeIdentifier: secondary.identifier,
+                    vocabulary: vocabulary
+                )
+            }
+            return result
+        } catch ProviderError.emptyTranscript {
+            // Primary locale returned empty — try secondary
+            if let secondary = state.readySecondaryLocale {
+                return try await provider.transcribe(
+                    audio: audio,
+                    localeIdentifier: secondary.identifier,
+                    vocabulary: vocabulary
+                )
+            }
+            throw ProviderError.emptyTranscript
+        }
     }
 
     private func refresh(expectedGeneration: Int) async {
@@ -126,6 +174,7 @@ final class AppleSpeechCoordinator: ObservableObject {
             guard generation == expectedGeneration else { return }
             state = .init(
                 selectedLocaleIdentifier: state.selectedLocaleIdentifier,
+                secondaryLocaleIdentifier: state.secondaryLocaleIdentifier,
                 locales: [],
                 readiness: .unavailable("Apple On-Device transcription requires macOS 26 or later.")
             )
@@ -138,6 +187,7 @@ final class AppleSpeechCoordinator: ObservableObject {
         guard !locales.isEmpty else {
             state = .init(
                 selectedLocaleIdentifier: requestedIdentifier,
+                secondaryLocaleIdentifier: state.secondaryLocaleIdentifier,
                 locales: [],
                 readiness: .unavailable("No Apple speech languages are available on this Mac.")
             )
@@ -147,6 +197,9 @@ final class AppleSpeechCoordinator: ObservableObject {
         let selectedIdentifier = resolvedSelection(requestedIdentifier, from: locales)
         state = .init(
             selectedLocaleIdentifier: selectedIdentifier,
+            secondaryLocaleIdentifier: state.secondaryLocaleIdentifier.flatMap { id in
+                locales.contains(where: { $0.identifier == id }) ? id : nil
+            },
             locales: locales,
             readiness: .checking
         )
@@ -161,8 +214,7 @@ final class AppleSpeechCoordinator: ObservableObject {
 
     private func apply(_ readiness: AppleSpeechReadiness, for requestedIdentifier: String) {
         let resolvedIdentifier = readiness.locale?.identifier ?? requestedIdentifier
-        if state.locales.contains(where: { $0.identifier == resolvedIdentifier }),
-           resolvedIdentifier != state.selectedLocaleIdentifier {
+        if resolvedIdentifier != state.selectedLocaleIdentifier {
             state.selectedLocaleIdentifier = resolvedIdentifier
             persistSelection(resolvedIdentifier)
         }
