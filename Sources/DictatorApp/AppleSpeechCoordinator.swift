@@ -137,9 +137,18 @@ final class AppleSpeechCoordinator: ObservableObject {
         guard let provider else {
             throw ProviderError.unsupported("Apple On-Device transcription requires macOS 26 or later.")
         }
+        // Safety net: if readiness is not .ready when transcribe is called
+        // (race condition between coordinator guard and this call, or state
+        // reset by a concurrent refresh), prepare before giving up.
+        if state.readyLocale == nil {
+            NSLog("[Dictator-Diag] coordinator.transcribe: readyLocale nil (readiness=%@), preparing", String(describing: state.readiness))
+            await prepare()
+        }
         guard let locale = state.readyLocale else {
+            NSLog("[Dictator-Diag] coordinator.transcribe: readyLocale still nil after prepare, throwing")
             throw ProviderError.invalidConfiguration("Download the selected Apple speech model before dictating.")
         }
+        NSLog("[Dictator-Diag] coordinator.transcribe: using locale %@/%@", locale.identifier, String(describing: locale.engine))
         do {
             let result = try await provider.transcribe(
                 audio: audio,

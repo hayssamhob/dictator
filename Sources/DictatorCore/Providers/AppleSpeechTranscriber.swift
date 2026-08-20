@@ -145,8 +145,14 @@ public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
         }
         let started = ContinuousClock.now
         var lastError: Error?
+        var attemptedAny = false
+
+        // Pass 1: only candidates whose assetStatus reports .installed.
         for candidate in candidates {
-            guard await runtime.assetStatus(for: candidate) == .installed else { continue }
+            let status = await runtime.assetStatus(for: candidate)
+            NSLog("[Dictator-Diag] transcribe pass1 %@/%@ status=%@", candidate.identifier, String(describing: candidate.engine), String(describing: status))
+            guard status == .installed else { continue }
+            attemptedAny = true
             do {
                 let segments = try await runtime.transcribe(audio: audio, locale: candidate, vocabulary: vocabulary)
                 let text = segments.filter(\.isFinal).map(\.text).joined()
@@ -162,9 +168,39 @@ public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                NSLog("[Dictator-Diag] transcribe pass1 %@/%@ failed: %@", candidate.identifier, String(describing: candidate.engine), String(describing: error))
                 lastError = error
             }
         }
+
+        // Pass 2 (optimistic fallback): if no candidate reported .installed
+        // (XPC flakiness can make assetStatus return wrong values even though
+        // the model is on disk), try every candidate anyway. The SpeechAnalyzer
+        // will throw a real error if the model is truly missing.
+        if !attemptedAny {
+            NSLog("[Dictator-Diag] transcribe pass2 (optimistic) — assetStatus reported no installed candidates, trying all anyway")
+            for candidate in candidates {
+                do {
+                    let segments = try await runtime.transcribe(audio: audio, locale: candidate, vocabulary: vocabulary)
+                    let text = segments.filter(\.isFinal).map(\.text).joined()
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty else { throw ProviderError.emptyTranscript }
+                    return TranscriptionResult(
+                        text: text,
+                        language: candidate.identifier,
+                        provider: .appleSpeech,
+                        model: candidate.engine.rawValue,
+                        latency: seconds(since: started)
+                    )
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    NSLog("[Dictator-Diag] transcribe pass2 %@/%@ failed: %@", candidate.identifier, String(describing: candidate.engine), String(describing: error))
+                    lastError = error
+                }
+            }
+        }
+
         if let lastError { throw lastError }
         throw ProviderError.invalidConfiguration("Download the selected Apple speech model before dictating.")
     }
