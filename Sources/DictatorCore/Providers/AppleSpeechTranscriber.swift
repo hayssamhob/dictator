@@ -201,7 +201,19 @@ public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
             }
         }
 
-        if let lastError { throw lastError }
+        if let lastError {
+            // Wrap generic Apple Speech errors (e.g. "The operation couldn't be
+            // completed") in a more helpful message that tells the user what to
+            // do, while preserving the original error for logging.
+            let nsError = lastError as NSError
+            if nsError.domain == NSCocoaErrorDomain || nsError.localizedDescription == "The operation couldn’t be completed." {
+                NSLog("[Dictator-Diag] transcribe: wrapping generic Apple error. domain=%@ code=%d", nsError.domain, nsError.code)
+                throw ProviderError.unsupported(
+                    "Apple's speech service is temporarily unavailable. Try dictating again in a few seconds — if the problem persists, restart Dictator or open System Settings → General → Language & Region → Speech to verify the on-device model."
+                )
+            }
+            throw lastError
+        }
         throw ProviderError.invalidConfiguration("Download the selected Apple speech model before dictating.")
     }
 
@@ -355,20 +367,68 @@ private struct SystemAppleSpeechRuntime: AppleSpeechRuntime {
         let foundationLocale = Locale(identifier: locale.identifier)
         switch locale.engine {
         case .speechTranscriber:
-            return try await analyze(
+            return try await analyzeWithForcePrepare(
                 sourceBuffer,
-                with: SpeechTranscriber(locale: foundationLocale, preset: .transcription),
-                context: .init()
+                locale: locale,
+                makeTranscriber: { SpeechTranscriber(locale: foundationLocale, preset: .transcription) },
+                makeContext: { .init() }
             )
         case .dictationTranscriber:
-            let context = AnalysisContext()
-            context.contextualStrings[.general] = Array(
-                vocabulary.filter(\.isEnabled).map(\.value).filter { !$0.isEmpty }.prefix(100)
+            return try await analyzeWithForcePrepare(
+                sourceBuffer,
+                locale: locale,
+                makeTranscriber: { DictationTranscriber(locale: foundationLocale, preset: .shortDictation) },
+                makeContext: {
+                    let context = AnalysisContext()
+                    context.contextualStrings[.general] = Array(
+                        vocabulary.filter(\.isEnabled).map(\.value).filter { !$0.isEmpty }.prefix(100)
+                    )
+                    return context
+                }
             )
+        }
+    }
+
+    /// Try analyze. If it fails, force-install the speech asset to kick the
+    /// flaky XPC service (com.apple.speech.localspeechrecognition) back to
+    /// life, then try once more.
+    private func analyzeWithForcePrepare<T: SpeechModule>(
+        _ sourceBuffer: AVAudioPCMBuffer,
+        locale: AppleSpeechLocale,
+        makeTranscriber: @escaping () -> T,
+        makeContext: @escaping () -> AnalysisContext
+    ) async throws -> [AppleSpeechSegment] where T.Result: SpeechTextResult {
+        do {
             return try await analyze(
                 sourceBuffer,
-                with: DictationTranscriber(locale: foundationLocale, preset: .shortDictation),
-                context: context
+                with: makeTranscriber(),
+                context: makeContext()
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            NSLog("[Dictator-Diag] transcribe: analyze failed, force-preparing asset for %@/%@ to kick XPC",
+                  locale.identifier, String(describing: locale.engine))
+            // Force-install the asset — this re-establishes the XPC connection
+            // and can recover from a stuck localspeechrecognition service.
+            do {
+                let speechModule = module(for: locale)
+                if let request = try await AssetInventory.assetInstallationRequest(supporting: [speechModule]) {
+                    NSLog("[Dictator-Diag] transcribe: force-installing asset (request created)")
+                    try await request.downloadAndInstall()
+                    NSLog("[Dictator-Diag] transcribe: force-install complete, retrying analyze")
+                } else {
+                    NSLog("[Dictator-Diag] transcribe: no install request returned, retrying analyze anyway")
+                }
+            } catch {
+                NSLog("[Dictator-Diag] transcribe: force-install failed: %@, retrying analyze anyway",
+                      String(describing: error))
+            }
+            // Retry analyze after force-prepare
+            return try await analyze(
+                sourceBuffer,
+                with: makeTranscriber(),
+                context: makeContext()
             )
         }
     }
@@ -392,36 +452,79 @@ private struct SystemAppleSpeechRuntime: AppleSpeechRuntime {
             throw ProviderError.unsupported("No compatible Apple speech audio format is available.")
         }
         let buffer = try AppleSpeechTranscriber.convert(sourceBuffer, to: targetFormat)
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
-        try await analyzer.setContext(context)
-        try await analyzer.prepareToAnalyze(in: targetFormat)
 
-        let resultTask = Task<[AppleSpeechSegment], Error> {
-            var segments: [AppleSpeechSegment] = []
-            for try await result in transcriber.results {
-                segments.append(.init(
-                    text: String(result.transcribedText.characters),
-                    isFinal: result.isFinal
-                ))
+        // Retry with backoff: the XPC service com.apple.speech.localspeechrecognition
+        // is flaky and can throw generic NSError ("The operation couldn't be
+        // completed") during prepareToAnalyze or analyzeSequence even when the
+        // model is installed on disk. Retrying with a short delay gives the XPC
+        // service time to recover.
+        let backoffSchedule: [Duration] = [.milliseconds(400), .milliseconds(800), .milliseconds(1_200)]
+        var lastError: Error?
+
+        for attempt in 0...backoffSchedule.count {
+            if attempt > 0 {
+                NSLog("[Dictator-Diag] analyze retry %d/%d after backoff", attempt, backoffSchedule.count)
+                try? await Task.sleep(for: backoffSchedule[attempt - 1])
             }
-            return segments
-        }
-        let input = AsyncStream<AnalyzerInput> { continuation in
-            continuation.yield(AnalyzerInput(buffer: buffer))
-            continuation.finish()
-        }
-        do {
-            if let lastSample = try await analyzer.analyzeSequence(input) {
-                try await analyzer.finalizeAndFinish(through: lastSample)
-            } else {
-                await analyzer.cancelAndFinishNow()
+
+            let analyzer = SpeechAnalyzer(modules: [transcriber])
+            do {
+                try await analyzer.setContext(context)
+                NSLog("[Dictator-Diag] analyze attempt %d: prepareToAnalyze", attempt)
+                try await analyzer.prepareToAnalyze(in: targetFormat)
+                NSLog("[Dictator-Diag] analyze attempt %d: prepareToAnalyze OK", attempt)
+
+                let resultTask = Task<[AppleSpeechSegment], Error> {
+                    var segments: [AppleSpeechSegment] = []
+                    for try await result in transcriber.results {
+                        segments.append(.init(
+                            text: String(result.transcribedText.characters),
+                            isFinal: result.isFinal
+                        ))
+                    }
+                    return segments
+                }
+                let input = AsyncStream<AnalyzerInput> { continuation in
+                    continuation.yield(AnalyzerInput(buffer: buffer))
+                    continuation.finish()
+                }
+                do {
+                    NSLog("[Dictator-Diag] analyze attempt %d: analyzeSequence", attempt)
+                    if let lastSample = try await analyzer.analyzeSequence(input) {
+                        try await analyzer.finalizeAndFinish(through: lastSample)
+                    } else {
+                        await analyzer.cancelAndFinishNow()
+                    }
+                    let segments = try await resultTask.value
+                    NSLog("[Dictator-Diag] analyze attempt %d: success (%d segments)", attempt, segments.count)
+                    return segments
+                } catch {
+                    resultTask.cancel()
+                    await analyzer.cancelAndFinishNow()
+                    logSpeechError(error, context: "analyzeSequence", attempt: attempt)
+                    throw error
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                logSpeechError(error, context: "prepareToAnalyze", attempt: attempt)
+                lastError = error
+                // Continue to next retry
             }
-            return try await resultTask.value
-        } catch {
-            resultTask.cancel()
-            await analyzer.cancelAndFinishNow()
-            throw error
         }
+
+        throw lastError ?? ProviderError.unsupported("Apple speech analysis failed after retries.")
+    }
+
+    private func logSpeechError(_ error: Error, context: String, attempt: Int) {
+        let nsError = error as NSError
+        NSLog("[Dictator-Diag] %@ attempt %d FAILED: domain=%@ code=%d desc=%@ userInfo=%@",
+              context,
+              attempt,
+              nsError.domain,
+              nsError.code,
+              nsError.localizedDescription,
+              String(describing: nsError.userInfo))
     }
 }
 
