@@ -1059,6 +1059,121 @@ final class AppBehaviorTests: XCTestCase {
         )
     }
 
+    func testHomeActivityBuildsSevenChronologicalDayBuckets() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let now = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 21, hour: 12
+        )))
+        let firstDay = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 15, hour: 9
+        )))
+        let today = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 21, hour: 10
+        )))
+        let transcripts = [
+            TranscriptRecord(
+                createdAt: firstDay, rawText: "one", finalText: "one",
+                sttProvider: .groq, sttModel: "whisper", audioDuration: 90,
+                sttLatency: 0.1, insertionOutcome: "inserted"
+            ),
+            TranscriptRecord(
+                createdAt: today, rawText: "two", finalText: "two",
+                sttProvider: .groq, sttModel: "whisper", audioDuration: 30,
+                sttLatency: 0.1, insertionOutcome: "inserted"
+            ),
+        ]
+
+        let activity = HomeDashboardAnalytics.activity(
+            in: transcripts,
+            endingAt: now,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(activity.count, 7)
+        XCTAssertEqual(activity.map(\.date), activity.map(\.date).sorted())
+        XCTAssertEqual(activity.first?.speechMinutes, 1.5)
+        XCTAssertEqual(activity.last?.speechMinutes, 0.5)
+        XCTAssertEqual(activity.dropFirst().dropLast().map(\.speechMinutes), Array(repeating: 0, count: 5))
+    }
+
+    func testHomeEstimatedMinutesSavedComparesSpeechWithFortyWPMTyping() {
+        let words = Array(repeating: "word", count: 240).joined(separator: " ")
+        let transcript = TranscriptRecord(
+            rawText: words, finalText: words, sttProvider: .groq, sttModel: "whisper",
+            audioDuration: 120, sttLatency: 0.1, insertionOutcome: "inserted"
+        )
+        var statistics = LifetimeStatistics()
+        statistics.record(transcript)
+
+        XCTAssertEqual(HomeDashboardAnalytics.estimatedMinutesSaved(from: statistics), 4)
+    }
+
+    func testHomeTranscriptSearchMatchesCurrentTextRawTextAndSourceApp() {
+        let revised = TranscriptRevision(
+            text: "Plan the September launch", origin: .manual, repairLatency: 0
+        )
+        let launch = TranscriptRecord(
+            createdAt: Date(timeIntervalSince1970: 300),
+            rawText: "Plan the August launch", finalText: "Plan the August launch",
+            sttProvider: .groq, sttModel: "whisper", sourceBundleID: "com.apple.mail",
+            audioDuration: 1, sttLatency: 0.1, insertionOutcome: "inserted",
+            revisions: [revised], preferredRevisionID: revised.id
+        )
+        let notes = TranscriptRecord(
+            createdAt: Date(timeIntervalSince1970: 200),
+            rawText: "Capture café notes", finalText: "Capture café notes",
+            sttProvider: .groq, sttModel: "whisper", sourceBundleID: "com.apple.Notes",
+            audioDuration: 1, sttLatency: 0.1, insertionOutcome: "inserted"
+        )
+
+        XCTAssertEqual(
+            HomeDashboardAnalytics.transcripts(matching: "september", in: [notes, launch]).map(\.id),
+            [launch.id]
+        )
+        XCTAssertEqual(
+            HomeDashboardAnalytics.transcripts(matching: "AUGUST", in: [notes, launch]).map(\.id),
+            [launch.id]
+        )
+        XCTAssertEqual(
+            HomeDashboardAnalytics.transcripts(matching: "cafe", in: [notes, launch]).map(\.id),
+            [notes.id]
+        )
+        XCTAssertEqual(
+            HomeDashboardAnalytics.transcripts(matching: "mail", in: [notes, launch]).map(\.id),
+            [launch.id]
+        )
+    }
+
+    func testHomeTopApplicationRanksKnownBundleIdentifiersByUsage() {
+        let transcripts = [
+            TranscriptRecord(
+                rawText: "One", finalText: "One", sttProvider: .groq, sttModel: "whisper",
+                sourceBundleID: "com.apple.mail", audioDuration: 1, sttLatency: 0.1,
+                insertionOutcome: "inserted"
+            ),
+            TranscriptRecord(
+                rawText: "Two", finalText: "Two", sttProvider: .groq, sttModel: "whisper",
+                sourceBundleID: "com.apple.Notes", audioDuration: 1, sttLatency: 0.1,
+                insertionOutcome: "inserted"
+            ),
+            TranscriptRecord(
+                rawText: "Three", finalText: "Three", sttProvider: .groq, sttModel: "whisper",
+                sourceBundleID: "com.apple.mail", audioDuration: 1, sttLatency: 0.1,
+                insertionOutcome: "inserted"
+            ),
+            TranscriptRecord(
+                rawText: "No app", finalText: "No app", sttProvider: .groq, sttModel: "whisper",
+                audioDuration: 1, sttLatency: 0.1, insertionOutcome: "clipboard"
+            ),
+        ]
+
+        XCTAssertEqual(
+            HomeDashboardAnalytics.topApplication(in: transcripts),
+            HomeApplicationUsage(bundleIdentifier: "com.apple.mail", transcriptCount: 2)
+        )
+    }
+
     func testUsageCurrencyFormattingUsesStableFractionPrecision() {
         XCTAssertEqual(
             UsageDisplayFormatter.currency(Decimal(string: "0.0119277777777777793024")!, complete: true),
@@ -1190,6 +1305,113 @@ final class AppBehaviorTests: XCTestCase {
     func testMissingFocusedTargetNeverTouchesAnotherApp() async {
         let result = await AccessibilityInserter().insert(.dictation("private text"), into: nil)
         XCTAssertEqual(result, .privateClipboard("no editable field was focused"))
+    }
+
+    func testClipboardModeCopiesResultInsteadOfInserting() async throws {
+        let suiteName = "ai.dictator.tests.clipboard-mode.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(InsertionMode.clipboard.rawValue, forKey: "insertionMode")
+
+        let recorder = TestAudioRecorder()
+        recorder.recordedAudio = .init(wavData: Data([1]), duration: 1)
+        let target = ApplicationTarget(
+            element: AXUIElementCreateApplication(4242),
+            name: "Mail",
+            bundleIdentifier: "com.apple.mail",
+            processIdentifier: 4242
+        )
+        let window = FocusedWindowSnapshot(
+            processIdentifier: 4242,
+            applicationName: "Mail",
+            bundleIdentifier: "com.apple.mail",
+            title: "Reply",
+            frame: CGRect(x: 10, y: 10, width: 800, height: 600)
+        )
+        let inserter = TestTargetInserter(target: .application(target), window: window)
+        let transcription = TestTranscriptionCoordinator(result: .init(
+            result: .init(text: "Copied not inserted", provider: .groq, model: "whisper", latency: 0.1),
+            mode: .online
+        ))
+        let model = AppModel(
+            keychain: HUDTestCredentialStore(),
+            appleSpeechProvider: nil,
+            defaults: defaults,
+            connectivity: HUDTestConnectivityMonitor(),
+            recorder: recorder,
+            transcriptionCoordinator: transcription,
+            inserter: inserter
+        )
+
+        await model.startDictation()
+        await model.stopDictation()
+
+        XCTAssertEqual(model.phase, .idle)
+        XCTAssertEqual(inserter.copiedText, "Copied not inserted")
+        XCTAssertNil(inserter.insertedText)
+        XCTAssertEqual(model.data.clipboard.first?.text, "Copied not inserted")
+        let record = try XCTUnwrap(model.data.transcripts.first)
+        XCTAssertEqual(record.insertionOutcome, InsertionResult.copiedToClipboard.label)
+    }
+
+    func testClipboardModePasteLatestCopiesInsteadOfPosting() async throws {
+        let suiteName = "ai.dictator.tests.clipboard-mode-paste-latest.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(InsertionMode.clipboard.rawValue, forKey: "insertionMode")
+
+        let target = ApplicationTarget(
+            element: AXUIElementCreateApplication(4242),
+            name: "Mail",
+            bundleIdentifier: "com.apple.mail",
+            processIdentifier: 4242
+        )
+        let window = FocusedWindowSnapshot(
+            processIdentifier: 4242,
+            applicationName: "Mail",
+            bundleIdentifier: "com.apple.mail",
+            title: "Reply",
+            frame: CGRect(x: 10, y: 10, width: 800, height: 600)
+        )
+        let inserter = TestTargetInserter(target: .application(target), window: window)
+        let model = AppModel(
+            keychain: HUDTestCredentialStore(),
+            appleSpeechProvider: nil,
+            defaults: defaults,
+            connectivity: HUDTestConnectivityMonitor(),
+            recorder: TestAudioRecorder(),
+            inserter: inserter
+        )
+        model.data.clipboard = [.init(text: "latest entry", rawText: "latest entry", sourceBundleID: nil)]
+
+        await model.pasteClipboard()
+        await model.pasteTranscriptText("transcript text")
+
+        XCTAssertEqual(inserter.copiedText, "transcript text")
+        XCTAssertNil(inserter.pastedText)
+    }
+
+    func testInsertionModePersistsAcrossLaunches() throws {
+        let suiteName = "ai.dictator.tests.insertion-mode-persistence.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let first = AppModel(
+            keychain: HUDTestCredentialStore(),
+            appleSpeechProvider: nil,
+            defaults: defaults,
+            connectivity: HUDTestConnectivityMonitor()
+        )
+        XCTAssertEqual(first.insertionMode, .insert)
+        first.setInsertionMode(.clipboard)
+
+        let second = AppModel(
+            keychain: HUDTestCredentialStore(),
+            appleSpeechProvider: nil,
+            defaults: defaults,
+            connectivity: HUDTestConnectivityMonitor()
+        )
+        XCTAssertEqual(second.insertionMode, .clipboard)
     }
 
     func testResolverPrefersExactEditableTarget() {
@@ -1597,6 +1819,8 @@ private final class TestTargetInserter: FocusedTargetInserting {
     let target: FocusedTarget
     let window: FocusedWindowSnapshot
     private(set) var insertedText: String?
+    private(set) var copiedText: String?
+    private(set) var pastedText: String?
 
     init(target: FocusedTarget, window: FocusedWindowSnapshot) {
         self.target = target
@@ -1609,7 +1833,14 @@ private final class TestTargetInserter: FocusedTargetInserting {
         insertedText = insertion.text
         return .pasteCommandPosted(.activeApplication)
     }
-    func pasteIntoFrontmostApp(_ text: String) async -> Bool { true }
+    func pasteIntoFrontmostApp(_ text: String) async -> Bool {
+        pastedText = text
+        return true
+    }
+    func copyToSystemClipboard(_ text: String) -> Bool {
+        copiedText = text
+        return true
+    }
 }
 
 private struct TestScreenAwareProvider: ScreenAwareLLMProvider {
