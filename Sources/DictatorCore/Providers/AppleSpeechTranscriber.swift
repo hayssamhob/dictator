@@ -15,7 +15,7 @@ public protocol LocalSpeechTranscribing: Sendable {
     ) async throws -> TranscriptionResult
 }
 
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 enum AppleSpeechAssetStatus: Equatable, Sendable {
     case installed
     case supported
@@ -23,13 +23,16 @@ enum AppleSpeechAssetStatus: Equatable, Sendable {
     case unsupported
 }
 
-@available(macOS 26.0, *)
-struct AppleSpeechSegment: Equatable, Sendable {
-    let text: String
-    let isFinal: Bool
+@available(macOS 26.0, iOS 26.0, *)
+public struct AppleSpeechSegment: Equatable, Sendable {
+    public let text: String
+    public let isFinal: Bool
+    /// Timestamped range in the source audio — kept so consumers that need
+    /// timed cues (e.g. subtitles) don't have to re-derive it.
+    public let range: CMTimeRange
 }
 
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 protocol AppleSpeechRuntime: Sendable {
     func supportedLocaleIdentifiers(for engine: AppleTranscriptionEngine) async -> [String]
     func equivalentLocaleIdentifier(to identifier: String, for engine: AppleTranscriptionEngine) async -> String?
@@ -45,7 +48,7 @@ protocol AppleSpeechRuntime: Sendable {
 #if canImport(Speech)
 import Speech
 
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
     private let runtime: any AppleSpeechRuntime
 
@@ -161,6 +164,33 @@ public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
         throw ProviderError.invalidConfiguration("Download the selected Apple speech model before dictating.")
     }
 
+    /// Same pipeline as `transcribe` but returns the raw timed segments —
+    /// the Speech framework already produces a `CMTimeRange` per result,
+    /// which the text-only API above flattens away.
+    public func transcribeSegments(
+        audio: RecordedAudio,
+        localeIdentifier: String,
+        vocabulary: [VocabularyEntry] = []
+    ) async throws -> [AppleSpeechSegment] {
+        let candidates = await candidates(for: localeIdentifier)
+        guard !candidates.isEmpty else {
+            throw ProviderError.unsupported("Apple speech transcription does not support this language on this Mac.")
+        }
+        var lastError: Error?
+        for candidate in candidates {
+            guard await runtime.assetStatus(for: candidate) == .installed else { continue }
+            do {
+                return try await runtime.transcribe(audio: audio, locale: candidate, vocabulary: vocabulary)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+            }
+        }
+        if let lastError { throw lastError }
+        throw ProviderError.invalidConfiguration("Download the selected Apple speech model before dictating.")
+    }
+
     private func candidates(for identifier: String) async -> [AppleSpeechLocale] {
         var candidates: [AppleSpeechLocale] = []
         for engine in [AppleTranscriptionEngine.speechTranscriber, .dictationTranscriber] {
@@ -182,6 +212,8 @@ public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
         var channelCount: UInt16?
         var bitsPerSample: UInt16?
         var formatCode: UInt16?
+        var fmtPayloadStart = 0
+        var fmtChunkSize = 0
         var pcmData: Data?
         while offset + 8 <= wav.count {
             let chunkID = String(data: wav[offset..<(offset + 4)], encoding: .ascii)
@@ -194,13 +226,20 @@ public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
                 channelCount = wav.uint16LE(at: payloadStart + 2)
                 sampleRate = Double(wav.uint32LE(at: payloadStart + 4))
                 bitsPerSample = wav.uint16LE(at: payloadStart + 14)
+                fmtPayloadStart = payloadStart
+                fmtChunkSize = chunkSize
             } else if chunkID == "data" {
                 pcmData = wav.subdata(in: payloadStart..<payloadEnd)
             }
             offset = payloadEnd + (chunkSize.isMultiple(of: 2) ? 0 : 1)
         }
 
-        guard formatCode == 1, channelCount == 1, bitsPerSample == 16,
+        // Accept plain PCM (0x0001) and WAVE_FORMAT_EXTENSIBLE (0xFFFE)
+        // whose SubFormat GUID is PCM — AVAssetWriter emits the latter.
+        let isPCM = formatCode == 1
+            || (formatCode == 0xFFFE && fmtChunkSize >= 40
+                && wav.uint16LE(at: fmtPayloadStart + 24) == 1)
+        guard isPCM, channelCount == 1, bitsPerSample == 16,
               let sampleRate, sampleRate > 0, let pcmData, !pcmData.isEmpty,
               let format = AVAudioFormat(
                 commonFormat: .pcmFormatInt16,
@@ -243,7 +282,7 @@ public actor AppleSpeechTranscriber: LocalSpeechTranscribing {
     }
 }
 
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 private struct SystemAppleSpeechRuntime: AppleSpeechRuntime {
     func supportedLocaleIdentifiers(for engine: AppleTranscriptionEngine) async -> [String] {
         switch engine {
@@ -322,6 +361,32 @@ private struct SystemAppleSpeechRuntime: AppleSpeechRuntime {
         }
     }
 
+    /// Copies a frame range of `source` into a fresh buffer (per-channel
+    /// memcpy — works for interleaved and non-interleaved layouts).
+    static func slice(
+        _ source: AVAudioPCMBuffer,
+        from startFrame: AVAudioFramePosition,
+        frames: AVAudioFrameCount
+    ) -> AVAudioPCMBuffer? {
+        guard let dst = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: frames)
+        else { return nil }
+        dst.frameLength = frames
+        let bytesPerFrame = Int(source.format.streamDescription.pointee.mBytesPerFrame)
+        let srcList = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: source.audioBufferList)
+        )
+        let dstList = UnsafeMutableAudioBufferListPointer(dst.mutableAudioBufferList)
+        for index in 0..<min(srcList.count, dstList.count) {
+            guard let srcData = srcList[index].mData, let dstData = dstList[index].mData
+            else { continue }
+            let byteOffset = Int(startFrame) * bytesPerFrame
+            let byteCount = Int(frames) * bytesPerFrame
+            dstData.copyMemory(from: srcData.advanced(by: byteOffset), byteCount: byteCount)
+            dstList[index].mDataByteSize = UInt32(byteCount)
+        }
+        return dst
+    }
+
     private func module(for locale: AppleSpeechLocale) -> any SpeechModule {
         let foundationLocale = Locale(identifier: locale.identifier)
         return switch locale.engine {
@@ -350,13 +415,29 @@ private struct SystemAppleSpeechRuntime: AppleSpeechRuntime {
             for try await result in transcriber.results {
                 segments.append(.init(
                     text: String(result.transcribedText.characters),
-                    isFinal: result.isFinal
+                    isFinal: result.isFinal,
+                    range: result.range
                 ))
             }
             return segments
         }
+        // Feed the analyzer in chunks — a single giant buffer makes the
+        // analyzer silently drop everything beyond its internal window
+        // (observed: only the last ~2.7 min of a 15-min file came back).
+        // Ranges on results stay absolute, so cue timing is unaffected.
         let input = AsyncStream<AnalyzerInput> { continuation in
-            continuation.yield(AnalyzerInput(buffer: buffer))
+            let framesPerChunk = AVAudioFrameCount(targetFormat.sampleRate * 10)
+            var offset: AVAudioFramePosition = 0
+            while offset < AVAudioFramePosition(buffer.frameLength) {
+                let count = min(
+                    AVAudioFramePosition(framesPerChunk),
+                    AVAudioFramePosition(buffer.frameLength) - offset
+                )
+                if let chunk = Self.slice(buffer, from: offset, frames: AVAudioFrameCount(count)) {
+                    continuation.yield(AnalyzerInput(buffer: chunk))
+                }
+                offset += count
+            }
             continuation.finish()
         }
         do {
@@ -394,18 +475,18 @@ private final class ConverterInput: @unchecked Sendable {
     }
 }
 
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 private protocol SpeechTextResult {
     var transcribedText: AttributedString { get }
     var isFinal: Bool { get }
 }
 
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 extension SpeechTranscriber.Result: SpeechTextResult {
     fileprivate var transcribedText: AttributedString { text }
 }
 
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 extension DictationTranscriber.Result: SpeechTextResult {
     fileprivate var transcribedText: AttributedString { text }
 }
