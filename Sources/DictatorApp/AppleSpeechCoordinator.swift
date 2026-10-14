@@ -1,5 +1,6 @@
 import DictatorCore
 import Foundation
+import Observation
 
 struct AppleSpeechSetupState: Equatable {
     var selectedLocaleIdentifier: String
@@ -19,8 +20,9 @@ struct AppleSpeechSetupState: Equatable {
 }
 
 @MainActor
-final class AppleSpeechCoordinator: ObservableObject {
-    @Published private(set) var state: AppleSpeechSetupState
+@Observable
+final class AppleSpeechCoordinator {
+    private(set) var state: AppleSpeechSetupState
 
     let isAvailable: Bool
     private let provider: (any LocalSpeechTranscribing)?
@@ -150,28 +152,20 @@ final class AppleSpeechCoordinator: ObservableObject {
         }
         NSLog("[Dictator-Diag] coordinator.transcribe: using locale %@/%@", locale.identifier, String(describing: locale.engine))
         do {
-            let result = try await provider.transcribe(
+            return try await provider.transcribe(
                 audio: audio,
                 localeIdentifier: locale.identifier,
-                vocabulary: vocabulary
+                vocabulary: vocabulary,
+                readyLocale: locale
             )
-            if !result.text.isEmpty { return result }
-            // Empty transcript — try secondary locale if set
-            if let secondary = state.readySecondaryLocale {
-                return try await provider.transcribe(
-                    audio: audio,
-                    localeIdentifier: secondary.identifier,
-                    vocabulary: vocabulary
-                )
-            }
-            return result
         } catch ProviderError.emptyTranscript {
             // Primary locale returned empty — try secondary
             if let secondary = state.readySecondaryLocale {
                 return try await provider.transcribe(
                     audio: audio,
                     localeIdentifier: secondary.identifier,
-                    vocabulary: vocabulary
+                    vocabulary: vocabulary,
+                    readyLocale: secondary
                 )
             }
             throw ProviderError.emptyTranscript
